@@ -1,0 +1,300 @@
+I. Session Based Authentication
+    * sessionStorage object *DATA WE STORE ON THE FRONTEND
+        - Storage object: can be used to access a browser's current session storage space
+        - Data in sessionStorage expires when a page's session ends
+            (or when a tab/browser is closed, the sessionStorage gets cleared)
+        - Basic Usage:
+            - sessionStorage.setItem("key", "value") => save data
+            - sessionStorage.getItem("key") => retrieve data
+            - sessionStorage.removeItem("key") => remove data
+            - sessionStorage.clear() => remove all data from sessionStorage
+                *Browder does this for us when we close the page
+
+    1. Attempt to log in using your credentials
+    2. Credentials verified, server creates a session with a session ID for you. Session stored in DB
+    3. Session ID stored in brower (client) as a cookie
+    4. Upon subsequent requests, cookie is verified against the session ID stored in the sever. If it's a match, the request is considered valid and processed. (Trying to do something that requires you to be logged in)
+    5. If you log out, session ID is destroyed on client and server sides
+
+II. Demo
+    * Setup Backend Configurations
+        A. Manage session cookies
+        B. Transform keys in Jbuilder and params (snakecase -> camelcase)
+        C. Use CSRF protection (foreign thing attempting to make user unintended requests)
+        D. Handle authentication errors
+    * Review and build Backend Authentication
+    * Setup Frontend to store and verify the session for all HTTP requests
+        A. Add CSRF headers to all outgoing AJAX requests
+        B. Create session actions and reducer
+    * Create session actions and reducer
+
+
+    rails new tea_shop -d=postgresql -T -G
+
+1. Change port for backend server
+    /config/puma.rb
+    port ENV.fetch("PORT") { 3000 } --> CHANGE TO 5000 (reserve 3000 for frontend)
+
+2. rails db:create
+
+3. Gemfile
+    * comment in gem 'jbuilder' and 'bcrypt'
+    * add annotate, better_errors, binding_of_caller, pry-rails
+    
+4. bundle install
+
+5. Add middleware that will help with cookies
+    /config/application.rb
+
+    class Application < Rails::Application
+        config.middleware.use ActionDispatch::Cookies
+        config.middleware.use ActionDispatch::Session::CookieStore,
+        key: '_appname_session',
+        same_site: :lax,
+        secure: Rails.env.production?
+    end
+
+6. Transform keys in Jbuilder
+    /config/environment.rb
+
+    Jbuilder.key_format camelize: :lower
+    Jbuilder.deep_format_keys true
+
+7. CSRF Protection
+    application_controller.rb
+    class ApplicationController < ActionController::API
+        include ActionController::RequestForgeryProtection
+
+        protect_from_forgery with: :exception
+        before_action :snake_case_params //runs before any controller actions run
+        before_action :attach_authenticity_token
+
+        private
+
+        #transforms something from camelCase to snake_case
+        def snake_case_params
+            params.deep_transform_keys!(&:underscore) 
+        end
+
+        def attach_authenticity_token
+            headers['X-CSRF-Token'] = masked_authenticity_token(session)
+        end
+
+    end
+
+8. Rails migration for users
+    rails g migration CreateUsers
+
+    /db/migrate/migration_file
+    t.string :username, null: false, index: { unique: true }
+    t.string :password_digest, null: false
+    t.string :session_token, null: false, index: { unique: true }
+
+    rails db:migrate
+
+9. Users model
+    app/models/user.rb
+
+    class User < ApplicationRecord
+        # given to us: 
+            # create password setter and getter
+            # validate presence of password
+            # defines User#authenticate(password)
+        has_secure_password 
+
+        #validations
+        validates :username, presence: true
+        valdiates :password, length: { minimum: 6 }, allow_nil: true
+
+        before_validation :ensure_session_token
+
+        #SPIRE
+        def self.find_by_credentials(username, password)
+            user = User.find_by(username: username)
+            if user&.authenticate(password)
+                user
+            else
+                nil
+            end
+        end
+
+        def reset_session_token!
+            self.session_token = generate_unique_session_token
+            self.save!
+            self.session_token
+        end
+
+        def ensure_session_token
+            self.session_token ||= generate_unique_session_token
+        end
+
+        private
+        def generate_unique_session_token
+            token = SecureRandom::urlsafe_base64
+            while User.exists?(session_token: token)
+                token = SecureRandom::urlsafe_base64
+            end
+            token
+        end
+    end
+
+10. Application controller: CRRLLL
+    app/controllers/application.rb
+    class ApplicationController < ActionController::API
+        #CRRLLL
+        def current_user
+            @current_user ||= User.find_by(session_token: session[session_token])
+        end
+
+        def require_logged_in
+            if !logged_in?
+                render json: { errors: ["Must be logged in"] }, status: :unauthorized
+            end
+        end
+
+        def require_logged_out
+            if logged_in?
+                render json: { errors: ["Must be logged out"] }, status: 403
+            end
+        end
+
+        def logged_in?
+            !!current_user
+        end
+
+        def login!(user)
+            session[:session_token] = user.reset_session_token!
+        end
+
+        def logout
+            current_user.reset_session_token!
+            session[:session_token] = nil
+            @current_user = nil
+        end
+    end
+
+11. Routes
+    config/routes.rb
+
+    namespace :api, defaults: { format: :json } do
+        resources :users, only: [:create, :index, :show]
+        resouce :session, only: [:create, :destroy, :show]
+    end
+
+12. Controllers: Users and Session
+
+    Terminal: rails g controller api/users
+    app/controllers/api/users_controller.rb
+
+    class Api::UsersController < ApplicationController
+
+        #add extra attribute name password (not smt we have in the DB)
+        wrap_parameters include: User.attribute_names + ["password"]
+
+        #have to be logged out in order to sign in
+        before_action :require_logged_out, only: [:create]
+
+        def create
+            @user = User.new(user_params)
+            if @user.save
+                login(@user)
+                render :show
+            else
+                render json: { errors: @user.errors.full_messages }, status: 422
+            end
+        end
+
+        def index
+            @users = User.all
+            render :index
+        end
+
+        def show
+            @user = User.find_by(id: params[:id])
+            render :show
+        end
+
+        private
+        def user_params
+            params.require(:user).permit(:username, :password)
+        end
+    end
+
+    #--------------------------------------------------------
+    Terminal: rails g controller api/sessions
+    app/controllers/api/sessions_controller.rb
+
+    class Api::SessionsController < ApplicationController
+        before_action :require_logged_in, only: [:destroy]
+        before action :require_logged_out, only: [:create]
+
+        def show
+            @user = current_user
+            if @user
+                render "api/users/show"
+            else 
+                render json: { user: nil }
+            end
+        end
+
+        def create
+            username = params[:username]
+            password = params[:password]
+            @user = User.find_by_credentials(username: username, password: password)
+            if @user
+                login(@user)
+                render "api/users/show"
+            else
+                render json: { errors: ["Invalid credentials"]}, status: 422
+            end
+        end
+
+        def destroy 
+            logout
+            #------------------------different-----------------------
+            #populate the http response with no content => no body
+            head :no_content
+            #--------------------------------------------------------
+        end
+    end
+
+
+13. Create View files
+    /app/views/api/users/index.json.jbuilder
+    @users.each do |user|
+        json.set! user.id do
+            json.extract! user, :id, :username, :created_at
+        end
+    end
+
+    /app/views/api/users/show.json.jbuilder
+    #json.___ without ! = creates custom key
+    json.user do
+        json.extract! @user, :id, :username, :created_at
+    end
+
+    This gets sent back to the frontend
+    user: {
+        id: 1
+        username: "Diego"
+        created_at: "1245678"
+    }
+
+14. Open frontend app and set up proxy
+    /frontend/package.json
+    create top-level key "proxy": "http://localhost:5000"
+
+    npm install
+
+15. Move frontend app into backend app
+
+16. In frontend/src/store/csrf.js
+
+    export const storeSession = async () => {
+        let res = await fetch('/api/session');
+        let token = res.headers.get('X-CSRF-Token');
+        // set it inside sessionStorage object
+        sessionStorage.setItem('X-CSRF-Token', token);
+        let data = await res.json();
+        sessionStorage.setItem('currentUser', JSON.stringify(data.user))
+    }
